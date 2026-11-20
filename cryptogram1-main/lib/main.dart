@@ -2114,7 +2114,7 @@ class _GameScreenState extends State<GameScreen> {
       // intent to skip, but keep the session active and the clock running.
       setState(() => _currentPuzzleSkipped = true);
       _queuePuzzleSave();
-      _showToast('llPuzzle skipped. Submit to close the session, or keep solving.');
+      _showToast('Puzzle skipped. Submit to close the session, or keep solving.');
       return;
     }
 
