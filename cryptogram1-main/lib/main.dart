@@ -843,6 +843,91 @@ class _LoginScreenState extends State<LoginScreen> {
     }
   }
 
+  // ─── Forgot password (database emails the password details) ─────────────────
+
+  Future<void> _showForgotPassword() async {
+    final ctrl = TextEditingController(text: _emailCtrl.text.trim());
+    String? message;
+    bool sending = false;
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          backgroundColor: AppColors.surface,
+          title: Text('Forgot password',
+              style: AppText.sans(size: 18, weight: FontWeight.w700)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Enter your company email and we\'ll email you the details to sign back in.',
+                style: AppText.sans(size: 12, color: AppColors.muted),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: ctrl,
+                keyboardType: TextInputType.emailAddress,
+                style: AppText.sans(size: 13),
+                decoration:
+                const InputDecoration(hintText: 'you@inspiritvision.com'),
+              ),
+              if (sending) ...[
+                const SizedBox(height: 12),
+                const LinearProgressIndicator(),
+              ],
+              if (message != null) ...[
+                const SizedBox(height: 12),
+                Text(message!,
+                    style: AppText.sans(size: 12, color: AppColors.sub)),
+              ],
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: sending ? null : () => Navigator.pop(dialogContext),
+              child: const Text('Close'),
+            ),
+            TextButton(
+              onPressed: sending
+                  ? null
+                  : () async {
+                final email = ctrl.text.trim();
+                if (!_emailRegex.hasMatch(email)) {
+                  setDialogState(() =>
+                  message = 'Please enter your company email address.');
+                  return;
+                }
+                setDialogState(() {
+                  sending = true;
+                  message = null;
+                });
+                try {
+                  await supabase.rpc('request_password_reset',
+                      params: {'p_email': email});
+                  setDialogState(() {
+                    sending = false;
+                    message =
+                    'If an account exists for this email, an email has been sent. Check your spam folder too.';
+                  });
+                } catch (e) {
+                  debugPrint('Forgot password error: $e');
+                  setDialogState(() {
+                    sending = false;
+                    message = 'Could not send the email. Please try again.';
+                  });
+                }
+              },
+              child: const Text('Send'),
+            ),
+          ],
+        ),
+      ),
+    );
+    ctrl.dispose();
+  }
+
   // ─── Google login ───────────────────────────────────────────────────────────
 
   Future<void> _handleGoogleSignIn() async {
@@ -1096,6 +1181,14 @@ class _LoginScreenState extends State<LoginScreen> {
               onPressed: () => setState(() => _obscure = !_obscure),
             ),
           ),
+          Align(
+            alignment: Alignment.centerRight,
+            child: TextButton(
+              onPressed: _loading ? null : _showForgotPassword,
+              child: Text('Forgot password?',
+                  style: AppText.sans(size: 12, color: AppColors.primary)),
+            ),
+          ),
           if (_error.isNotEmpty) ...[
             const SizedBox(height: 14),
             Container(
@@ -1254,7 +1347,6 @@ class _GameScreenState extends State<GameScreen> {
   bool _streakSaverEnabled = false;
   String? _lastSolvedDateIso;
   bool _enablingStreakSaverFromPrompt = false;
-  bool _openingStreakRecovery = false;
   Timer? _timer;
   bool _sessionComplete = false;
   bool _initializing = true;
@@ -1361,9 +1453,8 @@ class _GameScreenState extends State<GameScreen> {
     }
 
     if (mounted && _sessionLoadError == null) {
-      // A missed-day recovery challenge is checked before gameplay resumes.
-      // The server owns the date and frozen-streak decision.
-      await _refreshStreakRecoveryState(openChallengeIfRequired: true);
+      // Load the streak and Streak Saver state before gameplay resumes.
+      await _refreshStreakRecoveryState();
       if (!mounted) return;
       _startTimer();
       // If the saved guesses already solve the puzzle but the previous finish
@@ -1560,9 +1651,7 @@ class _GameScreenState extends State<GameScreen> {
     throw StateError('Supabase returned an invalid streak recovery response.');
   }
 
-  Future<void> _refreshStreakRecoveryState({
-    bool openChallengeIfRequired = false,
-  }) async {
+  Future<void> _refreshStreakRecoveryState() async {
     final userId = int.tryParse(widget.userId);
     if (userId == null) return;
 
@@ -1582,11 +1671,6 @@ class _GameScreenState extends State<GameScreen> {
         _lastSolvedDateIso = _dateKeyFromDatabaseValue(state['last_solved_date']);
       });
 
-      if (_streakSaverEnabled && openChallengeIfRequired &&
-          state['recovery_required'] == true &&
-          !_openingStreakRecovery) {
-        await _openStreakRecovery(state);
-      }
     } catch (e) {
       debugPrint('Streak recovery status error: $e');
       // Do not block daily gameplay when the optional feature is unavailable.
@@ -1594,74 +1678,6 @@ class _GameScreenState extends State<GameScreen> {
     }
   }
 
-  Future<void> _openStreakRecovery(Map<String, dynamic> initialState) async {
-    if (_openingStreakRecovery || !mounted) return;
-    _openingStreakRecovery = true;
-    try {
-      var state = initialState;
-      final userId = int.parse(widget.userId);
-      var ciphertext = state['recovery_ciphertext']?.toString() ?? '';
-      if (ciphertext.trim().isEmpty) {
-        final result = await supabase.rpc(
-          'start_streak_recovery',
-          params: {'p_user_id': userId},
-        );
-        if (result != true) {
-          // A second signed-in tab may have created the challenge first; fetch
-          // the canonical server-created puzzle either way.
-          debugPrint('Streak recovery challenge was already initialized or could not be started.');
-        }
-        state = _rpcMap(await supabase.rpc(
-          'get_streak_recovery_state',
-          params: {'p_user_id': userId},
-        ));
-        ciphertext = state['recovery_ciphertext']?.toString() ?? '';
-      }
-
-      if (ciphertext.isEmpty) {
-        throw StateError('Could not initialize the streak recovery puzzle.');
-      }
-      final userValue = state['recovery_user_map'];
-      final userMap = userValue is Map
-          ? userValue.map<String, String>((key, value) => MapEntry(
-          key.toString().toUpperCase(), value.toString().toUpperCase()))
-          : <String, String>{};
-
-      if (!mounted) return;
-      await Navigator.of(context).push<bool>(MaterialPageRoute(
-        fullscreenDialog: true,
-        builder: (_) => _StreakRecoveryScreen(
-          ciphertext: ciphertext,
-          userMap: userMap,
-          onSaveProgress: (guesses) async {
-            final result = await supabase.rpc(
-              'save_streak_recovery_progress',
-              params: {'p_user_id': userId, 'p_user_map': guesses},
-            );
-            if (result != true) {
-              throw StateError('Could not save recovery progress.');
-            }
-          },
-          onComplete: (guesses) async {
-            final result = await supabase.rpc(
-              'complete_streak_recovery',
-              params: {'p_user_id': userId, 'p_user_map': guesses},
-            );
-            return result == true;
-          },
-        ),
-      ));
-      await _refreshStreakRecoveryState();
-      await _fetchStreak();
-    } catch (e) {
-      debugPrint('Streak recovery screen error: $e');
-      if (mounted) {
-        _showToast('Streak recovery could not be loaded: $e');
-      }
-    } finally {
-      _openingStreakRecovery = false;
-    }
-  }
 
   Future<void> _enableStreakSaverFromPrompt() async {
     if (_enablingStreakSaverFromPrompt) return;
@@ -1682,10 +1698,10 @@ class _GameScreenState extends State<GameScreen> {
       }
       if (!mounted) return;
       setState(() => _streakSaverEnabled = true);
-      await _refreshStreakRecoveryState(openChallengeIfRequired: true);
+      await _refreshStreakRecoveryState();
       if (mounted) {
         _showToast(
-          'Streak Saver enabled. If you miss one day, solve a recovery cryptogram to preserve your streak.',
+            'Streak Saver enabled. If you miss one day your streak will not be removed.',
         );
       }
     } catch (e) {
@@ -1763,8 +1779,8 @@ class _GameScreenState extends State<GameScreen> {
                         color: AppColors.text)),
                 subtitle: Text(
                   selectedValue
-                      ? 'If you miss one day, solve a random recovery cryptogram to preserve your streak. Progress is saved automatically.'
-                      : 'Off: missing a day breaks your streak as usual. Turn this on to get one-day recovery through a cryptogram.',
+                      ? 'On: if you miss one day, your streak will not be removed.'
+                      : 'Off: missing a day breaks your streak as usual. Turn this on to protect your streak if you miss one day.',
                   style: AppText.sans(size: 12, color: AppColors.muted),
                 ),
               ),
@@ -1790,9 +1806,7 @@ class _GameScreenState extends State<GameScreen> {
     );
 
     if (mounted) {
-      await _refreshStreakRecoveryState(
-        openChallengeIfRequired: _streakSaverEnabled,
-      );
+      await _refreshStreakRecoveryState();
     }
   }
 
@@ -2399,6 +2413,7 @@ class _GameScreenState extends State<GameScreen> {
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
               child: Column(
                 children: [
+                  _buildStreakSaverHint(),
                   if (_showStreakSaverPrompt) ...[
                     _buildStreakSaverRiskPrompt(),
                     const SizedBox(height: 18),
@@ -2497,7 +2512,7 @@ class _GameScreenState extends State<GameScreen> {
           ),
           const SizedBox(height: 7),
           Text(
-            'Your streak is at risk because you have not solved today’s puzzle yet. Enable Streak Saver now to get one missed day to recover it with a special cryptogram.',
+            'Your streak is at risk because you have not solved today’s puzzle yet. Enable Streak Saver now so one missed day will not remove your streak.',
             style: AppText.sans(size: 12, color: AppColors.muted),
           ),
           const SizedBox(height: 12),
@@ -2528,7 +2543,27 @@ class _GameScreenState extends State<GameScreen> {
       ),
     );
   }
-
+  Widget _buildStreakSaverHint() {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 18),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.local_fire_department_outlined,
+              color: AppColors.amber, size: 16),
+          const SizedBox(width: 6),
+          Flexible(
+            child: Text(
+              'Streak Saver: open the menu at the top right and tap Streak Saver Settings to protect your streak if you miss a day.',
+              textAlign: TextAlign.center,
+              style: AppText.sans(size: 12, color: AppColors.amber),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
   Widget _buildWord(String word) => Row(
     mainAxisSize: MainAxisSize.min,
     children: word.split('').map(_buildCell).toList(),
@@ -3012,202 +3047,6 @@ class _GameScreenState extends State<GameScreen> {
                         ? AppColors.muted.withValues(alpha: 0.28)
                         : AppColors.muted)),
           ]),
-        ),
-      ),
-    );
-  }
-}
-
-// ─── Missed-day streak recovery challenge ────────────────────────────────────
-
-class _StreakRecoveryScreen extends StatefulWidget {
-  final String ciphertext;
-  final Map<String, String> userMap;
-  final Future<void> Function(Map<String, String>) onSaveProgress;
-  final Future<bool> Function(Map<String, String>) onComplete;
-
-  const _StreakRecoveryScreen({
-    required this.ciphertext,
-    required this.userMap,
-    required this.onSaveProgress,
-    required this.onComplete,
-  });
-
-  @override
-  State<_StreakRecoveryScreen> createState() => _StreakRecoveryScreenState();
-}
-
-class _StreakRecoveryScreenState extends State<_StreakRecoveryScreen> {
-  final Map<String, String> _guesses = {};
-  Future<void> _saveQueue = Future<void>.value();
-  bool _busy = false;
-  String? _error;
-  final List<String> _alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
-
-  @override
-  void initState() {
-    super.initState();
-    _guesses.addAll(widget.userMap);
-  }
-
-  List<String> get _cipherLetters {
-    final seen = <String>{};
-    return widget.ciphertext
-        .toUpperCase()
-        .split('')
-        .where((ch) => RegExp(r'[A-Z]').hasMatch(ch) && seen.add(ch))
-        .toList();
-  }
-
-  String get _decodedText => widget.ciphertext.split('').map((char) {
-    final upper = char.toUpperCase();
-    if (!RegExp(r'[A-Z]').hasMatch(upper)) return char;
-    return _guesses[upper] ?? '·';
-  }).join();
-
-  Future<void> _saveGuesses() {
-    final snapshot = Map<String, String>.from(_guesses);
-    final pending = _saveQueue.catchError((Object _) {}).then((_) => widget.onSaveProgress(snapshot));
-    _saveQueue = pending;
-    return pending;
-  }
-
-  Future<void> _setGuess(String cipher, String? guess) async {
-    if (_busy) return;
-    setState(() {
-      if (guess == null) {
-        _guesses.remove(cipher);
-      } else {
-        _guesses.removeWhere((key, value) => value == guess && key != cipher);
-        _guesses[cipher] = guess;
-      }
-      _error = null;
-    });
-
-    try {
-      await _saveGuesses();
-      if (_cipherLetters.every((cipher) => _guesses.containsKey(cipher))) {
-        await _finishChallenge();
-      }
-    } catch (e) {
-      if (mounted) setState(() => _error = 'Could not save your progress. Check your connection and retry.');
-    }
-  }
-
-  Future<void> _finishChallenge() async {
-    if (_busy) return;
-    setState(() {
-      _busy = true;
-      _error = null;
-    });
-    try {
-      await _saveQueue;
-      final solved = await widget.onComplete(Map<String, String>.from(_guesses));
-      if (!mounted) return;
-      if (solved) {
-        Navigator.of(context).pop(true);
-      } else {
-        setState(() {
-          _busy = false;
-          _error = 'Not quite. Check the letter mappings and try again.';
-        });
-      }
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          _busy = false;
-          _error = 'The server could not verify the answer. Please check your connection and try again.';
-        });
-      }
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final encrypted = widget.ciphertext.toUpperCase();
-    return PopScope(
-      canPop: false,
-      child: Scaffold(
-        backgroundColor: AppColors.bg,
-        appBar: AppBar(
-          backgroundColor: AppColors.header,
-          foregroundColor: AppColors.text,
-          title: Text('STREAK RECOVERY', style: AppText.mono(size: 14, weight: FontWeight.w700, letterSpacing: 2)),
-          automaticallyImplyLeading: false,
-        ),
-        body: SafeArea(
-          child: Center(
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 760),
-              child: ListView(
-                padding: const EdgeInsets.all(20),
-                children: [
-                  const Icon(Icons.local_fire_department_rounded, size: 38, color: AppColors.amber),
-                  const SizedBox(height: 12),
-                  Text('Your streak is frozen for one missed day', textAlign: TextAlign.center,
-                      style: AppText.sans(size: 20, weight: FontWeight.w700)),
-                  const SizedBox(height: 8),
-                  Text('Solve this random cryptogram to preserve your current streak. Your guesses are saved automatically.',
-                      textAlign: TextAlign.center, style: AppText.sans(size: 13, color: AppColors.muted)),
-                  const SizedBox(height: 22),
-                  Container(
-                    padding: const EdgeInsets.all(16),
-                    decoration: BoxDecoration(color: AppColors.surface, borderRadius: BorderRadius.circular(14), border: Border.all(color: AppColors.border)),
-                    child: SelectableText(encrypted, textAlign: TextAlign.center,
-                        style: AppText.mono(size: 17, weight: FontWeight.w700, letterSpacing: 1.1, color: AppColors.text)),
-                  ),
-                  const SizedBox(height: 12),
-                  Text('Choose a plaintext letter for each cipher letter. Each answer can be used only once.',
-                      style: AppText.sans(size: 12, color: AppColors.muted)),
-                  const SizedBox(height: 12),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    children: [
-                      for (final cipher in _cipherLetters)
-                        Container(
-                          width: 72,
-                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
-                          decoration: BoxDecoration(color: AppColors.surface, borderRadius: BorderRadius.circular(10), border: Border.all(color: AppColors.border)),
-                          child: Column(
-                            children: [
-                              Text(cipher, style: AppText.mono(size: 17, weight: FontWeight.w700, color: AppColors.primary)),
-                              const SizedBox(height: 4),
-                              DropdownButtonHideUnderline(
-                                child: DropdownButton<String>(
-                                  value: _guesses[cipher],
-                                  hint: Text('?', style: AppText.sans(size: 13, color: AppColors.muted)),
-                                  isExpanded: true,
-                                  dropdownColor: AppColors.surface,
-                                  items: _alphabet.map((letter) => DropdownMenuItem<String>(
-                                    value: letter,
-                                    child: Text(letter, style: AppText.mono(size: 14, color: AppColors.text)),
-                                  )).toList(),
-                                  onChanged: _busy ? null : (guess) => _setGuess(cipher, guess),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                    ],
-                  ),
-                  const SizedBox(height: 16),
-                  Text('Your decoded text', style: AppText.sans(size: 12, weight: FontWeight.w700, color: AppColors.muted)),
-                  const SizedBox(height: 6),
-                  Text(_decodedText, style: AppText.mono(size: 14, color: AppColors.text)),
-                  if (_error != null) ...[
-                    const SizedBox(height: 12),
-                    Text(_error!, style: AppText.sans(size: 12, color: AppColors.red)),
-                  ],
-                  if (_busy) ...[
-                    const SizedBox(height: 18),
-                    const Center(child: CircularProgressIndicator(color: AppColors.primary)),
-                  ],
-                  const SizedBox(height: 20),
-                ],
-              ),
-            ),
-          ),
         ),
       ),
     );
