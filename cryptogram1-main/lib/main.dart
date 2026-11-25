@@ -563,9 +563,10 @@ class AppText {
 }
 
 String formatTime(int seconds) {
-  final m = (seconds ~/ 60).toString().padLeft(2, '0');
+  final h = seconds ~/ 3600;
+  final m = ((seconds % 3600) ~/ 60).toString().padLeft(2, '0');
   final s = (seconds % 60).toString().padLeft(2, '0');
-  return '$m:$s';
+  return h > 0 ? '$h:$m:$s' : '$m:$s';
 }
 
 String _todayLabel() {
@@ -1453,10 +1454,11 @@ class _GameScreenState extends State<GameScreen> {
     }
 
     if (mounted && _sessionLoadError == null) {
-      // Load the streak and Streak Saver state before gameplay resumes.
+      // Start the clock right away instead of waiting for the streak lookup.
+      _startTimer();
+      // Load the streak and Streak Saver state.
       await _refreshStreakRecoveryState();
       if (!mounted) return;
-      _startTimer();
       // If the saved guesses already solve the puzzle but the previous finish
       // request failed, retry the normal solve/close flow on resume.
       _checkSolved();
@@ -3359,12 +3361,11 @@ class _TimerBadge extends StatelessWidget {
       child: Row(mainAxisSize: MainAxisSize.min, children: [
         const Icon(Icons.schedule_rounded, size: 12, color: AppColors.amber),
         const SizedBox(width: 4),
-        SizedBox(
-          width: 42,
-          child: Text(formatTime(timeElapsed),
-              style: AppText.mono(
-                  size: 13, weight: FontWeight.w700, color: AppColors.amber)),
-        ),
+       Text(formatTime(timeElapsed),
+          softWrap: false,
+          style: AppText.mono(
+              size: 13, weight: FontWeight.w700, color: AppColors.amber)),
+
       ]),
     );
   }
