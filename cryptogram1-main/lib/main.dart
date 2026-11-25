@@ -1348,6 +1348,11 @@ class _GameScreenState extends State<GameScreen> {
   bool _streakSaverEnabled = false;
   String? _lastSolvedDateIso;
   bool _enablingStreakSaverFromPrompt = false;
+
+  // Tutorial: the clock is frozen while it is open and resumes when it closes.
+  Duration _tutorialPaused = Duration.zero;
+  DateTime? _tutorialOpenedAt;
+  static const Duration _maxTutorialPause = Duration(minutes: 5);
   Timer? _timer;
   bool _sessionComplete = false;
   bool _initializing = true;
@@ -1382,7 +1387,10 @@ class _GameScreenState extends State<GameScreen> {
   int _elapsedSinceStart() {
     final startedAt = _sessionStartedAt;
     if (startedAt == null) return _timeElapsed;
-    final seconds = DateTime.now().toUtc().difference(startedAt.toUtc()).inSeconds;
+    // While the tutorial is open, "now" is frozen at the moment it was opened.
+    final now = _tutorialOpenedAt ?? DateTime.now().toUtc();
+    final seconds =
+        (now.toUtc().difference(startedAt.toUtc()) - _tutorialPaused).inSeconds;
     return seconds < 0 ? 0 : seconds;
   }
 
@@ -1510,6 +1518,10 @@ class _GameScreenState extends State<GameScreen> {
         ..addAll(_boolList(state['puzzle_was_skipped']));
 
       _puzzleTimeElapsed = (state['puzzle_time_elapsed'] as num?)?.toInt() ?? 0;
+      final pausedSeconds =
+          (state['tutorial_paused_seconds'] as num?)?.toInt() ?? 0;
+      _tutorialPaused = Duration(
+          seconds: pausedSeconds.clamp(0, _maxTutorialPause.inSeconds).toInt());
     } finally {
       _restoringState = false;
     }
@@ -1549,6 +1561,7 @@ class _GameScreenState extends State<GameScreen> {
       'hints_used_per_puzzle': _hintsUsedPerPuzzle,
       'puzzle_times': _puzzleTimes,
       'puzzle_was_skipped': _puzzleWasSkipped,
+      'tutorial_paused_seconds': _tutorialPaused.inSeconds,
       if (completionReason != null) 'completionReason': completionReason,
     };
   }
@@ -1842,6 +1855,38 @@ class _GameScreenState extends State<GameScreen> {
         .split('')
         .where((c) => RegExp(r'[A-Z]').hasMatch(c) && seen.add(c))
         .toList();
+  }
+  // ─── Tutorial (the clock stops while it is open) ──────────────────────────
+
+  Future<void> _openTutorial() async {
+    if (_tutorialOpenedAt != null ||
+        _sessionComplete ||
+        _finishing ||
+        _initializing) {
+      return;
+    }
+
+    // Freeze the clock.
+    _tutorialOpenedAt = DateTime.now().toUtc();
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute(builder: (_) => const TutorialScreen()),
+    );
+
+    // Resume the clock. Time spent in the tutorial counts as paused, up to
+    // the 5 minute limit.
+    final openedAt = _tutorialOpenedAt;
+    _tutorialOpenedAt = null;
+    if (openedAt != null) {
+      final openFor = DateTime.now().toUtc().difference(openedAt);
+      final remaining = _maxTutorialPause - _tutorialPaused;
+      if (remaining > Duration.zero) {
+        _tutorialPaused += openFor < remaining ? openFor : remaining;
+      }
+    }
+    if (!mounted) return;
+    setState(_refreshElapsedTime);
+    _keyboardFocusNode.requestFocus();
+    _queuePuzzleSave();
   }
 
   // ─── Timer ────────────────────────────────────────────────────────────────
@@ -2326,6 +2371,8 @@ class _GameScreenState extends State<GameScreen> {
                 _StreakBadge(streak: _currentStreak!),
                 const SizedBox(width: 8),
               ],
+              _TutorialButton(onTap: _openTutorial),
+              const SizedBox(width: 8),
               _MenuButton(
                 fullName: widget.fullName,
                 username: widget.username,
@@ -3492,6 +3539,226 @@ class _PillButton extends StatelessWidget {
                       size: 12, weight: FontWeight.w600, color: color)),
             ]),
           ),
+        ),
+      ),
+    );
+  }
+}
+// ─── Tutorial button (game screen header) ─────────────────────────────────────
+
+class _TutorialButton extends StatelessWidget {
+  final VoidCallback onTap;
+  const _TutorialButton({required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final showLabel = MediaQuery.of(context).size.width >= 520;
+    return Tooltip(
+      message: 'Tutorial',
+      child: Material(
+        color: AppColors.primary.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(9),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(9),
+          onTap: onTap,
+          child: Container(
+            height: 32,
+            padding: const EdgeInsets.symmetric(horizontal: 9),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(9),
+              border: Border.all(
+                  color: AppColors.primary.withValues(alpha: 0.25)),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.school_outlined,
+                    size: 15, color: AppColors.primary),
+                if (showLabel) ...[
+                  const SizedBox(width: 5),
+                  Text('Tutorial',
+                      style: AppText.sans(
+                          size: 12,
+                          weight: FontWeight.w600,
+                          color: AppColors.primary)),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ─── Tutorial screen ──────────────────────────────────────────────────────────
+
+class TutorialScreen extends StatelessWidget {
+  const TutorialScreen({super.key});
+
+  static const String _sentence = 'LIFE IS A JOURNEY';
+
+  // A fixed example cipher: every letter is replaced by a different letter.
+  static const Map<String, String> _cipher = {
+    'L': 'Q', 'I': 'T', 'F': 'B', 'E': 'W', 'S': 'K', 'A': 'M',
+    'J': 'D', 'O': 'Z', 'U': 'P', 'R': 'H', 'N': 'G', 'Y': 'C',
+  };
+
+  String _scramble(String text) =>
+      text.split('').map((ch) => _cipher[ch] ?? ch).join();
+
+  Widget _label(String text) => Padding(
+    padding: const EdgeInsets.only(bottom: 8),
+    child: Text(text,
+        textAlign: TextAlign.center,
+        style: AppText.sans(
+            size: 11,
+            weight: FontWeight.w700,
+            color: AppColors.muted,
+            letterSpacing: 1.2)),
+  );
+
+  Widget _sentenceBox(String text, Color color) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 18),
+    decoration: BoxDecoration(
+      color: AppColors.surface,
+      borderRadius: BorderRadius.circular(14),
+      border: Border.all(color: AppColors.border),
+    ),
+    child: Text(text,
+        textAlign: TextAlign.center,
+        style: AppText.mono(
+            size: 22,
+            weight: FontWeight.w700,
+            color: color,
+            letterSpacing: 4)),
+  );
+
+  Widget _keyChip(String from, String to) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+    decoration: BoxDecoration(
+      color: AppColors.surface,
+      borderRadius: BorderRadius.circular(10),
+      border: Border.all(color: AppColors.border),
+    ),
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(from,
+            style: AppText.mono(
+                size: 16, weight: FontWeight.w700, color: AppColors.text)),
+        Text('  →  ', style: AppText.mono(size: 14, color: AppColors.muted)),
+        Text(to,
+            style: AppText.mono(
+                size: 16,
+                weight: FontWeight.w700,
+                color: AppColors.primary)),
+      ],
+    ),
+  );
+
+  @override
+  Widget build(BuildContext context) {
+    final keyLetters = <String>[];
+    for (final ch in _sentence.split('')) {
+      if (_cipher.containsKey(ch) && !keyLetters.contains(ch)) {
+        keyLetters.add(ch);
+      }
+    }
+
+    return Scaffold(
+      backgroundColor: AppColors.bg,
+      body: SafeArea(
+        child: Column(
+          children: [
+            Container(
+              height: 54,
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              decoration: const BoxDecoration(
+                color: AppColors.header,
+                border: Border(bottom: BorderSide(color: AppColors.border)),
+              ),
+              child: Row(
+                children: [
+                  const SizedBox(width: 48),
+                  Expanded(
+                    child: Text('TUTORIAL',
+                        textAlign: TextAlign.center,
+                        style: AppText.mono(
+                            size: 15,
+                            weight: FontWeight.w700,
+                            letterSpacing: 3,
+                            color: AppColors.text)),
+                  ),
+                  IconButton(
+                    tooltip: 'Back to the puzzle',
+                    icon: const Icon(Icons.close_rounded,
+                        color: AppColors.muted),
+                    onPressed: () => Navigator.of(context).pop(),
+                  ),
+                ],
+              ),
+            ),
+            Expanded(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(20),
+                child: Center(
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 560),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Text(
+                            'Your timer is paused while you are here (for up to 5 minutes).',
+                            textAlign: TextAlign.center,
+                            style: AppText.sans(
+                                size: 12, color: AppColors.amber)),
+                        const SizedBox(height: 20),
+                        _label('THE SENTENCE'),
+                        _sentenceBox(_sentence, AppColors.text),
+                        const SizedBox(height: 22),
+                        _label('THE SCRAMBLED SENTENCE'),
+                        _sentenceBox(_scramble(_sentence), AppColors.primary),
+                        const SizedBox(height: 22),
+                        _label('WHICH LETTER BECAME WHICH'),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          alignment: WrapAlignment.center,
+                          children: [
+                            for (final ch in keyLetters)
+                              _keyChip(ch, _cipher[ch]!),
+                          ],
+                        ),
+                        const SizedBox(height: 22),
+                        Text(
+                            'Every letter is always replaced by the same other letter. Here, I becomes T in both LIFE and IS, and E becomes W in both LIFE and JOURNEY. In the real puzzle, you work backwards from the scrambled letters to find the original sentence.',
+                            textAlign: TextAlign.center,
+                            style: AppText.sans(
+                                size: 12, color: AppColors.muted)),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 8, 20, 20),
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 560),
+                  child: SizedBox(
+                    width: double.infinity,
+                    height: 50,
+                    child: ElevatedButton(
+                      onPressed: () => Navigator.of(context).pop(),
+                      child: const Text('Return to the puzzle'),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
         ),
       ),
     );
